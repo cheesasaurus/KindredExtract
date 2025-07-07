@@ -3,6 +3,7 @@ using System.Collections;
 using System.Collections.Generic;
 using System.Text;
 using KindredExtract.Models;
+using Unity.Entities;
 
 namespace KindredExtract.Dumpers;
 
@@ -52,7 +53,7 @@ class EcsSystemDumper
             sb.AppendLine();
             sb.AppendLine();
         }
-        
+
         return sb.ToString();
     }
 
@@ -85,16 +86,17 @@ class EcsSystemDumper
 
     private void AppendSectionMultipleParents(StringBuilder sb, EcsSystemHierarchy systemHierarchy)
     {
+        var world = systemHierarchy.World;
         var nodesWithMultipleParents = systemHierarchy.FindNodesWithMultipleParents();
         var singleIndent = new String(' ', _spacesPerIndent);
         sb.AppendLine($"[Systems in multiple groups] - this probably shouldn't happen!");
         foreach (var node in nodesWithMultipleParents)
         {
-            sb.AppendLine($"{SystemTypeDescription(node)} - belongs to {node.Parents.Count} groups");
+            sb.AppendLine($"{SystemTypeDescription(world, node)} - belongs to {node.Parents.Count} groups");
             foreach (var parent in node.Parents)
             {
                 sb.Append(singleIndent);
-                sb.Append($"{SystemTypeDescription(parent)}");
+                sb.Append($"{SystemTypeDescription(world, parent)}");
                 sb.AppendLine();
             }
         }
@@ -107,26 +109,26 @@ class EcsSystemDumper
         sb.AppendLine($"[Update Hierarchy] note: the ordering at root level is arbitrary, but everything within a group is in update order for that group");
         foreach (var node in systemHierarchy.RootNodesUnordered)
         {
-            AppendTreeNode(sb, node, 0);
+            AppendTreeNode(systemHierarchy.World, sb, node, 0);
         }
     }
 
-    private void AppendTreeNode(StringBuilder sb, EcsSystemTreeNode node, int depth)
+    private void AppendTreeNode(World world, StringBuilder sb, EcsSystemTreeNode node, int depth)
     {
         var leftPadding = new String(' ', _spacesPerIndent * depth);
         sb.Append(leftPadding);
-        sb.Append(SystemDescription(node));
+        sb.Append(SystemDescription(world, node));
         sb.AppendLine();
         foreach (var childNode in node.ChildrenOrderedForUpdate)
         {
-            AppendTreeNode(sb, childNode, depth + 1);
+            AppendTreeNode(world, sb, childNode, depth + 1);
         }
     }
 
-    internal static string SystemDescription(EcsSystemTreeNode node)
+    internal static string SystemDescription(World world, EcsSystemTreeNode node)
     {
         IList<String> parts = new List<String>();
-        parts.Add(SystemTypeDescription(node));
+        parts.Add(SystemTypeDescription(world, node));
         if (node.Category.Equals(EcsSystemCategory.Group))
         {
             parts.Add($"{node.ChildrenOrderedForUpdate.Count} children");
@@ -138,7 +140,7 @@ class EcsSystemDumper
         return String.Join(" | ", parts);
     }
 
-    internal static string SystemTypeDescription(EcsSystemTreeNode node)
+    internal static string SystemTypeDescription(World world, EcsSystemTreeNode node)
     {
         switch (node.Category)
         {
@@ -150,8 +152,28 @@ class EcsSystemDumper
                 return $"{node.Type} (ISystem)";
             default:
             case EcsSystemCategory.Unknown:
-                return "<unknown system type>";
+                return LookupUnknownSystemType(world, node);
         }
+    }
+
+    internal static string LookupUnknownSystemType(World world, EcsSystemTreeNode node)
+    {
+        var systemType = world.Unmanaged.GetTypeOfSystem(node.SystemHandle);
+        return $"{systemType.FullName} (formerly Unknown)";
+
+        // todo: rewrite the entire thing to stem from TypeManager.GetSystemTypeIndices()
+        // and using Il2cppblahblah.Type instead of System.Type
+        // I think all that dancing around with assembly scanning and type analysis can be trashed.
+        //
+        // SystemTypeIndex.IsManaged
+        // SystemTypeIndex.IsGroup
+        // TypeManager.GetSystemName(systemTypeIndex)
+        // world.GetExistingSystem(systemTypeIndex)
+        // world.Unmanaged.GetTypeOfSystem(systemHandle)
+
+
+
+        //return "<unknown system type>";
     }
 
 }
