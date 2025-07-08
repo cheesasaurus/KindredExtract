@@ -115,7 +115,7 @@ Feel free to reach out to me on discord (odjit) if you have any questions or nee
 - `.dump prefabnames`
   - Dumps prefab names to JSON
 - `.dump systems`
-  - Dumps ECS system hierarchies to files (per world)
+  - Dumps ECS system update hierarchies to files (per world)
   - shortcut: .dump s
   
   

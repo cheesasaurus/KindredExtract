@@ -1,194 +1,187 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Text;
 using BepInEx.Logging;
 using KindredExtract.Models;
-using Unity.Collections;
 using Unity.Entities;
 
 namespace KindredExtract.Services;
 
+
 // responsible for building a systems update hierarchy for any given world
-internal class EcsSystemHierarchyService
+public class EcsSystemHierarchyService
 {
-    private EcsSystemFinderService _systemFinderService;
     private ManualLogSource Log;
 
-    public EcsSystemHierarchyService(EcsSystemFinderService systemFinderService, ManualLogSource log)
+    public EcsSystemHierarchyService(ManualLogSource log)
     {
-        _systemFinderService = systemFinderService;
         Log = log;
     }
 
     public EcsSystemHierarchy BuildSystemHiearchyForWorld(World world)
     {
+        Log.LogInfo($"building hierarchy for world: {world.Name}");
         var knownUnknowns = new KnownUnknowns();
-        var systemGroupInstances = _systemFinderService.FindSystemGroupInstances(world, knownUnknowns);
-        var systemBaseInstances = _systemFinderService.FindSystemBaseInstances(world, knownUnknowns);
+        var nodes = FindSystems(world, out var counts);
+        var groupNodes = nodes.Values.Where(node => node.Category is EcsSystemCategory.Group);
 
-        var managedSystemsDict = new Dictionary<SystemHandle, (Type, ComponentSystemBase)>();
-        foreach (var (systemGroupType, systemGroup) in systemGroupInstances)
+        foreach (var groupNode in groupNodes)
         {
-            // ComponentSystemGroup is a subclass of ComponentSystemBase, so add them first (more specific)
-            managedSystemsDict.TryAdd(systemGroup.SystemHandle, (systemGroupType, systemGroup));
-        }
-        foreach (var (systemBaseType, systemBase) in systemBaseInstances)
-        {
-            // add all other instances of ComponentSystemBase whose intitial types we're aware of
-            managedSystemsDict.TryAdd(systemBase.SystemHandle, (systemBaseType, systemBase));
-        }
-
-        var unmanagedSystemHandles = _systemFinderService.FindUnmanagedSystemHandles(world);
-        var unmanagedSystemsDict = new Dictionary<SystemHandle, Type>();
-        foreach (var (unmanagedSystemType, systemHandle) in unmanagedSystemHandles)
-        {
-            unmanagedSystemsDict.TryAdd(systemHandle, unmanagedSystemType);
-        }
-
-        return BuildSystemsHierarchy(world, systemGroupInstances, managedSystemsDict, unmanagedSystemsDict, knownUnknowns);
-    }
-
-    private EcsSystemHierarchy BuildSystemsHierarchy(
-        World world,
-        IList<(Type, ComponentSystemGroup)> systemGroupInstances,
-        Dictionary<SystemHandle, (Type, ComponentSystemBase)> managedSystemsDict,
-        Dictionary<SystemHandle, Type> unmanagedSystemsDict,
-        KnownUnknowns knownUnknowns
-    )
-    {
-        var counts = new EcsSystemCounts()
-        {
-            Group = systemGroupInstances.Count,
-            Base = managedSystemsDict.Count,
-            Unmanaged = unmanagedSystemsDict.Count,
-            Unknown = 0,
-        };
-        var allNodesDict = new Dictionary<SystemHandle, EcsSystemTreeNode>();
-
-        // first pass: ensure all groups have a node in the dict
-        foreach (var (systemGroupType, systemGroup) in systemGroupInstances)
-        {
-            var groupNode = new EcsSystemTreeNode(
-                category: EcsSystemCategory.Group,
-                systemHandle: systemGroup.SystemHandle,
-                type: systemGroupType,
-                instance: systemGroup
-            );
-            if (!allNodesDict.ContainsKey(systemGroup.SystemHandle))
+            try
             {
-                allNodesDict.Add(systemGroup.SystemHandle, groupNode);
-            }
-        }
-
-        // second pass: add edges for group nodes, and initialize non-group nodes in Dict
-        foreach (var (systemGroupType, systemGroup) in systemGroupInstances)
-        {
-            var parentNode = allNodesDict[systemGroup.SystemHandle];
-
-            var orderedSubsystems = systemGroup.GetAllSystems();
-            foreach (var subsystemHandle in orderedSubsystems)
-            {
-                EcsSystemCategory subsystemCategory = EcsSystemCategory.Unknown;
-                Type subsystemType = null;
-                ComponentSystemBase subsystemInstance = null;
-
-                if (managedSystemsDict.ContainsKey(subsystemHandle))
+                var group = groupNode.Instance.Cast<ComponentSystemGroup>();
+                var orderedSubsystems = group.GetAllSystems();
+                foreach (var subsystemHandle in orderedSubsystems)
                 {
-                    var (bestKnownType, subsystem) = managedSystemsDict[subsystemHandle];
-                    subsystemCategory = (subsystem is ComponentSystemGroup) ? EcsSystemCategory.Group : EcsSystemCategory.Base;
-                    subsystemType = bestKnownType;
-                    subsystemInstance = subsystem;
-                }
-                else if (unmanagedSystemsDict.ContainsKey(subsystemHandle))
-                {
-                    subsystemCategory = EcsSystemCategory.Unmanaged;
-                    subsystemType = unmanagedSystemsDict[subsystemHandle];
-                }
-                else
-                {
-                    counts.Unknown++;
-                }
+                    if (!nodes.TryGetValue(subsystemHandle, out var childNode))
+                    {
+                        if (TryGetSystemTypeIndex_ForMissedSystem(world, subsystemHandle, out var subsystemTypeIndex))
+                        {
+                            childNode = BuildNodeAndIncrementAppropriateCount(world, subsystemTypeIndex, counts);
+                        }
+                        else
+                        {
+                            Log.LogWarning($"A Group's child system does not exist within the world. Group: {groupNode.Type.FullName} ({groupNode.Category})");
+                            counts.Unknown++;
+                            knownUnknowns.SystemNotFoundInWorld.Add(subsystemHandle);
 
-                EcsSystemTreeNode childNode;
-                if (allNodesDict.ContainsKey(subsystemHandle))
-                {
-                    childNode = allNodesDict[subsystemHandle];
+                            childNode = new EcsSystemTreeNode(
+                                category: EcsSystemCategory.Unknown,
+                                systemHandle: subsystemHandle,
+                                type: null,
+                                instance: null
+                            );
+                        }
+                    }
+
+                    groupNode.ChildrenOrderedForUpdate.Add(childNode);
+                    if (childNode.Parents.Count > 0)
+                    {
+                        Log.LogWarning($"Uh oh, a system belongs to multiple groups. This should not happen: {childNode.Type}");
+                    }
+                    childNode.Parents.Add(groupNode);
                 }
-                else
-                {
-                    childNode = new EcsSystemTreeNode(
-                        category: subsystemCategory,
-                        systemHandle: subsystemHandle,
-                        type: subsystemType,
-                        instance: subsystemInstance
-                    );
-                    allNodesDict.Add(subsystemHandle, childNode);
-                }
-                parentNode.ChildrenOrderedForUpdate.Add(childNode);
-                if (childNode.Parents.Count > 0)
-                {
-                    Log.LogError($"Uh oh, a system belongs to multiple groups. This should not happen: {childNode.Type}");
-                }
-                childNode.Parents.Add(parentNode);
+            }
+            catch (Exception ex)
+            {
+                Log.LogWarning($"{groupNode.Type.FullName} ({groupNode.Category})");
+                Log.LogWarning(ex);
             }
         }
 
-        // find root groups
-        var ungroupedNodes = new HashSet<EcsSystemTreeNode>();
-        foreach (var (systemGroupType, systemGroup) in systemGroupInstances)
-        {
-            var node = allNodesDict[systemGroup.SystemHandle];
-            if (node.Parents.Count == 0)
-            {
-                ungroupedNodes.Add(node);
-            }
-        }
+        var rootNodes = nodes.Values.Where(node => node.Parents.Count is 0);
 
-        // now add all other ungrouped systems
-        foreach (var systemHandle in world.Unmanaged.GetAllSystems(Allocator.Temp))
-        {
-            if (allNodesDict.ContainsKey(systemHandle))
-            {
-                continue;
-            }
-            EcsSystemCategory systemCategory = EcsSystemCategory.Unknown;
-            Type systemType = null;
-            ComponentSystemBase systemInstance = null;
-
-            if (managedSystemsDict.ContainsKey(systemHandle))
-            {
-                var (bestKnownType, system) = managedSystemsDict[systemHandle];
-                systemCategory = (system is ComponentSystemGroup) ? EcsSystemCategory.Group : EcsSystemCategory.Base;
-                systemType = bestKnownType;
-                systemInstance = system;
-            }
-            else if (unmanagedSystemsDict.ContainsKey(systemHandle))
-            {
-                systemCategory = EcsSystemCategory.Unmanaged;
-                systemType = unmanagedSystemsDict[systemHandle];
-            }
-            else
-            {
-                counts.Unknown++;
-            }
-
-            var node = new EcsSystemTreeNode(
-                category: systemCategory,
-                systemHandle: systemHandle,
-                type: systemType,
-                instance: systemInstance
-            );
-            allNodesDict.Add(systemHandle, node);
-            ungroupedNodes.Add(node);
-        }
-
-        return new EcsSystemHierarchy()
+        return new EcsSystemHierarchy
         {
             World = world,
             Counts = counts,
             KnownUnknowns = knownUnknowns,
-            RootNodesUnordered = ungroupedNodes.ToList(),
+            RootNodesUnordered = rootNodes.ToList(),
         };
+    }
+
+    private Dictionary<SystemHandle, EcsSystemTreeNode> FindSystems(World world, out EcsSystemCounts counts)
+    {
+        var nodes = new Dictionary<SystemHandle, EcsSystemTreeNode>();
+        counts = new EcsSystemCounts();
+
+        var systemTypeIndices = TypeManager.GetSystemTypeIndices(WorldSystemFilterFlags.All, 0);
+        foreach (var systemTypeIndex in systemTypeIndices)
+        {
+            var systemHandle = world.GetExistingSystem(systemTypeIndex);
+            if (!world.Unmanaged.IsSystemValid(systemHandle))
+            {
+                counts.NotUsed++;
+                continue;
+            }
+
+            var node = BuildNodeAndIncrementAppropriateCount(world, systemTypeIndex, counts);
+            nodes.Add(systemHandle, node);
+        }
+
+        return nodes;
+    }
+
+    private EcsSystemTreeNode BuildNodeAndIncrementAppropriateCount(World world, SystemTypeIndex systemTypeIndex, EcsSystemCounts counts)
+    {
+        var systemHandle = world.GetExistingSystem(systemTypeIndex);
+        var systemType = world.Unmanaged.GetTypeOfSystem(systemHandle);
+        var category = CategorizeSystem(systemTypeIndex);
+
+        var node = new EcsSystemTreeNode(
+            category: category,
+            systemHandle: systemHandle,
+            type: systemType,
+            instance: world.GetExistingSystemInternal(systemTypeIndex)
+        );
+
+        switch (category)
+        {
+            case EcsSystemCategory.Group:
+                counts.Group++;
+                break;
+            case EcsSystemCategory.Base:
+                counts.Base++;
+                break;
+            case EcsSystemCategory.Unmanaged:
+                counts.Unmanaged++;
+                break;
+        }
+
+        return node;
+    }
+
+    private EcsSystemCategory CategorizeSystem(SystemTypeIndex systemTypeIndex)
+    {
+        return systemTypeIndex.IsGroup ? EcsSystemCategory.Group : systemTypeIndex.IsManaged ? EcsSystemCategory.Base : EcsSystemCategory.Unmanaged;
+    }
+
+    private bool TryGetSystemTypeIndex_ForMissedSystem(World world, SystemHandle systemHandle, out SystemTypeIndex systemTypeIndex, bool logDebug = true)
+    {
+        systemTypeIndex = SystemTypeIndex.Null;
+
+        if (systemHandle.Equals(SystemHandle.Null))
+        {
+            return false;
+        }
+        if (!world.Unmanaged.IsSystemValid(systemHandle))
+        {
+            return false;
+        }
+        
+        var systemType = world.Unmanaged.GetTypeOfSystem(systemHandle);
+        if (systemType is null)
+        {
+            return false;
+        }
+
+        systemTypeIndex = TypeManager.GetSystemTypeIndex(systemType);
+
+        if (logDebug)
+        {
+            var existsInList = false;
+            foreach (var otherSystemTypeIndex in TypeManager.GetSystemTypeIndices())
+            {
+                if (systemTypeIndex.Equals(otherSystemTypeIndex))
+                {
+                    existsInList = true;
+                    break;
+                }
+            }
+
+            var sb = new StringBuilder();
+            sb.AppendLine($"Found missed system {systemType.FullName}.");
+            sb.AppendLine($"  SystemTypeIndex.Index: {systemTypeIndex.Index} (retrieved from TypeManager.GetSystemTypeIndex)");
+            sb.Append($"  Is SystemTypeIndex in TypeManager.GetSystemTypeIndices: {existsInList}");
+            if (!existsInList)
+            {
+                sb.Append($" (This might be a bug in the TypeManager)");
+            }
+            Log.LogDebug(sb.ToString());
+        }
+
+        return true;
     }
 
 }
